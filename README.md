@@ -60,6 +60,13 @@ Note that running `update.bat` is important, otherwise you may be using a previo
 
 Note that the models will be downloaded automatically. You will download more than 30GB from HuggingFace.
 
+### RTX 20 Series (Turing, sm_75)
+
+* Use the new `update_nv20.bat` and `run_nv20.bat` scripts to prepare and launch on Windows laptops/desktops with RTX 2060/2070/2080 GPUs. The run script binds Gradio to `0.0.0.0:7860` and sets conservative allocator limits for 6GB cards.
+* These scripts force fp16 math, disable bf16/flash-attn by default, and respect the `FRAMEPACK_DISABLE_BF16`, `FRAMEPACK_DISABLE_FLASH_ATTN`, and `FRAMEPACK_FORCE_FP16` environment variables if you want to override the defaults.
+* At runtime the model now auto-detects the GPU capability and falls back through SageAttention → xFormers (fp16) → PyTorch SDPA (fp16/ fp32). Varlen attention falls back to segmented SDPA when no optimized kernel is available. Expect slower generation than 30/40/50 series cards—this is normal for SDPA on Turing.
+* Installing xFormers is optional but recommended for a small speed boost; flash-attn remains disabled on sm_75 unless you explicitly re-enable it.
+
 **Linux**:
 
 We recommend having an independent Python 3.10.
