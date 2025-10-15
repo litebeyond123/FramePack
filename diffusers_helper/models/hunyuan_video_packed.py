@@ -1,3 +1,4 @@
+import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -18,6 +19,71 @@ from diffusers_helper.dit_common import LayerNorm
 from diffusers_helper.utils import zero_module
 
 
+logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def turing_or_older() -> bool:
+    if not torch.cuda.is_available():
+        return False
+
+    major, minor = torch.cuda.get_device_capability()
+    return (major, minor) < (8, 0)
+
+
+def _get_device_capability() -> Tuple[int, int]:
+    if not torch.cuda.is_available():
+        return (0, 0)
+
+    return torch.cuda.get_device_capability()
+
+
+_DEVICE_CAPABILITY = _get_device_capability()
+_TURING_OR_OLDER = turing_or_older()
+
+_FORCE_FP16 = _env_flag("FRAMEPACK_FORCE_FP16", _TURING_OR_OLDER)
+_DISABLE_BF16 = _env_flag("FRAMEPACK_DISABLE_BF16", _TURING_OR_OLDER or _FORCE_FP16)
+if _FORCE_FP16:
+    _DISABLE_BF16 = True
+_DISABLE_FLASH_ATTN = _env_flag("FRAMEPACK_DISABLE_FLASH_ATTN", _TURING_OR_OLDER)
+
+
+try:  # Optional dependency
+    from xformers.ops import memory_efficient_attention as xformers_attn_func
+    _XFORMERS_AVAILABLE = True
+except Exception as exc:  # pylint: disable=broad-except
+    logger.debug("xFormers import failed: %s", exc)
+    xformers_attn_func = None
+    _XFORMERS_AVAILABLE = False
+
+
+try:  # Optional dependency
+    from flash_attn import flash_attn_varlen_func, flash_attn_func
+    _FLASH_ATTN_AVAILABLE = True
+except Exception as exc:  # pylint: disable=broad-except
+    logger.debug("Flash-Attn import failed: %s", exc)
+    flash_attn_varlen_func = None
+    flash_attn_func = None
+    _FLASH_ATTN_AVAILABLE = False
+
+
+try:  # Optional dependency
+    from sageattention import sageattn_varlen, sageattn
+    _SAGE_AVAILABLE = True
+except Exception as exc:  # pylint: disable=broad-except
+    logger.debug("SageAttention import failed: %s", exc)
+    sageattn_varlen = None
+    sageattn = None
+    _SAGE_AVAILABLE = False
+
+
 enabled_backends = []
 
 if torch.backends.cuda.flash_sdp_enabled():
@@ -29,36 +95,37 @@ if torch.backends.cuda.mem_efficient_sdp_enabled():
 if torch.backends.cuda.cudnn_sdp_enabled():
     enabled_backends.append("cudnn")
 
-print("Currently enabled native sdp backends:", enabled_backends)
-
-try:
-    # raise NotImplementedError
-    from xformers.ops import memory_efficient_attention as xformers_attn_func
-    print('Xformers is installed!')
-except:
-    print('Xformers is not installed!')
-    xformers_attn_func = None
-
-try:
-    # raise NotImplementedError
-    from flash_attn import flash_attn_varlen_func, flash_attn_func
-    print('Flash Attn is installed!')
-except:
-    print('Flash Attn is not installed!')
-    flash_attn_varlen_func = None
-    flash_attn_func = None
-
-try:
-    # raise NotImplementedError
-    from sageattention import sageattn_varlen, sageattn
-    print('Sage Attn is installed!')
-except:
-    print('Sage Attn is not installed!')
-    sageattn_varlen = None
-    sageattn = None
+_ATTN_LOG_ONCE: set[str] = set()
 
 
-logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+def _log_once(message: str) -> None:
+    if message in _ATTN_LOG_ONCE:
+        return
+    logger.info(message)
+    _ATTN_LOG_ONCE.add(message)
+
+
+_log_once(
+    "FramePack attention config: sm_%d%d, force_fp16=%s, disable_bf16=%s, disable_flash_attn=%s, "
+    "xformers=%s, flash_attn=%s, sage=%s, native_sdpa=%s"
+    % (
+        _DEVICE_CAPABILITY[0],
+        _DEVICE_CAPABILITY[1],
+        _FORCE_FP16,
+        _DISABLE_BF16,
+        _DISABLE_FLASH_ATTN,
+        _XFORMERS_AVAILABLE,
+        _FLASH_ATTN_AVAILABLE,
+        _SAGE_AVAILABLE,
+        enabled_backends,
+    )
+)
+
+if _DISABLE_FLASH_ATTN:
+    _log_once("FlashAttention backend disabled for this device")
+
+if not _XFORMERS_AVAILABLE:
+    _log_once("xFormers backend not available; will rely on SDPA fallbacks")
 
 
 def pad_for_3d_conv(x, kernel_size):
@@ -105,39 +172,162 @@ def apply_rotary_emb_transposed(x, freqs_cis):
     return out
 
 
+def _sdpa_with_dtype_fallback(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attn_mask=None) -> torch.Tensor:
+    """Run PyTorch SDPA with fp16->fp32 fallback and preserve input dtype."""
+
+    target_dtypes = [torch.float16, torch.float32]
+    last_err: Optional[Exception] = None
+    original_dtype = q.dtype
+
+    for dtype in target_dtypes:
+        try:
+            q_cast = q.to(dtype)
+            k_cast = k.to(dtype)
+            v_cast = v.to(dtype)
+            output = torch.nn.functional.scaled_dot_product_attention(
+                q_cast.transpose(1, 2),
+                k_cast.transpose(1, 2),
+                v_cast.transpose(1, 2),
+                attn_mask=attn_mask,
+            ).transpose(1, 2)
+
+            return output.to(original_dtype)
+        except Exception as err:  # pylint: disable=broad-except
+            last_err = err
+            _log_once(f"SDPA failed on {dtype} ({type(err).__name__})")
+
+    assert last_err is not None
+    raise last_err
+
+
+def _manual_varlen_sdpa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_kv: int,
+) -> torch.Tensor:
+    """Fallback implementation for varlen attention via segmented SDPA."""
+
+    batch = q.shape[0]
+    output = torch.zeros_like(q)
+
+    if isinstance(max_seqlen_q, torch.Tensor):
+        max_seqlen_q = int(max_seqlen_q.item())
+    if isinstance(max_seqlen_kv, torch.Tensor):
+        max_seqlen_kv = int(max_seqlen_kv.item())
+
+    for b in range(batch):
+        start_q = cu_seqlens_q[2 * b].item()
+        end_q = cu_seqlens_q[2 * b + 1].item()
+        actual_q_len = max(min(end_q - start_q, max_seqlen_q), 0)
+
+        start_k = cu_seqlens_kv[2 * b].item()
+        end_k = cu_seqlens_kv[2 * b + 1].item()
+        actual_k_len = max(min(end_k - start_k, max_seqlen_kv), 0)
+
+        if actual_q_len == 0 or actual_k_len == 0:
+            continue
+
+        local_q = q[b, :actual_q_len].unsqueeze(0)
+        local_k = k[b, :actual_k_len].unsqueeze(0)
+        local_v = v[b, :actual_k_len].unsqueeze(0)
+
+        local_out = _sdpa_with_dtype_fallback(local_q, local_k, local_v)[0]
+        output[b, :actual_q_len] = local_out
+
+        # Preserve padding tail untouched
+
+    _log_once("Varlen attention falling back to segmented PyTorch SDPA")
+    return output
+
+
+def _maybe_cast_fp16(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.dtype == torch.float16:
+        return tensor
+
+    if _DISABLE_BF16 and tensor.dtype == torch.bfloat16:
+        return tensor.to(torch.float16)
+
+    if _FORCE_FP16 and tensor.dtype != torch.float16:
+        return tensor.to(torch.float16)
+
+    return tensor
+
+
 def attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv):
-    if cu_seqlens_q is None and cu_seqlens_kv is None and max_seqlen_q is None and max_seqlen_kv is None:
-        if sageattn is not None:
-            x = sageattn(q, k, v, tensor_layout='NHD')
-            return x
+    q = _maybe_cast_fp16(q)
+    k = _maybe_cast_fp16(k)
+    v = _maybe_cast_fp16(v)
 
-        if flash_attn_func is not None:
-            x = flash_attn_func(q, k, v)
-            return x
+    use_varlen = all(x is not None for x in (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv))
 
-        if xformers_attn_func is not None:
-            x = xformers_attn_func(q, k, v)
-            return x
+    if not use_varlen:
+        if _SAGE_AVAILABLE and sageattn is not None:
+            try:
+                output = sageattn(q, k, v, tensor_layout="NHD")
+                _log_once("Attention backend: SageAttention")
+                return output
+            except Exception as err:  # pylint: disable=broad-except
+                _log_once(f"SageAttention failed, falling back ({type(err).__name__})")
 
-        x = torch.nn.functional.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)).transpose(1, 2)
-        return x
+        if not _DISABLE_FLASH_ATTN and _FLASH_ATTN_AVAILABLE and flash_attn_func is not None:
+            try:
+                output = flash_attn_func(q, k, v)
+                _log_once("Attention backend: FlashAttention")
+                return output.to(q.dtype)
+            except Exception as err:  # pylint: disable=broad-except
+                _log_once(f"FlashAttention failed, falling back ({type(err).__name__})")
 
-    B, L, H, C = q.shape
+        if _XFORMERS_AVAILABLE and xformers_attn_func is not None:
+            try:
+                q_fp16 = q.to(torch.float16)
+                k_fp16 = k.to(torch.float16)
+                v_fp16 = v.to(torch.float16)
+                output = xformers_attn_func(q_fp16, k_fp16, v_fp16)
+                _log_once("Attention backend: xFormers memory efficient attention (fp16)")
+                return output.to(q.dtype)
+            except Exception as err:  # pylint: disable=broad-except
+                _log_once(f"xFormers failed on fp16, falling back to SDPA ({type(err).__name__})")
 
-    q = q.flatten(0, 1)
-    k = k.flatten(0, 1)
-    v = v.flatten(0, 1)
+        _log_once("Attention backend: PyTorch SDPA fallback")
+        return _sdpa_with_dtype_fallback(q, k, v)
 
-    if sageattn_varlen is not None:
-        x = sageattn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
-    elif flash_attn_varlen_func is not None:
-        x = flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
-    else:
-        raise NotImplementedError('No Attn Installed!')
+    if _SAGE_AVAILABLE and sageattn_varlen is not None:
+        try:
+            flat_q = q.flatten(0, 1)
+            flat_k = k.flatten(0, 1)
+            flat_v = v.flatten(0, 1)
+            output = sageattn_varlen(flat_q, flat_k, flat_v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
+            output = output.unflatten(0, (q.shape[0], q.shape[1]))
+            _log_once("Varlen attention backend: SageAttention")
+            return output
+        except Exception as err:  # pylint: disable=broad-except
+            _log_once(f"Varlen SageAttention failed, falling back ({type(err).__name__})")
 
-    x = x.unflatten(0, (B, L))
+    if not _DISABLE_FLASH_ATTN and _FLASH_ATTN_AVAILABLE and flash_attn_varlen_func is not None:
+        try:
+            flat_q = q.flatten(0, 1)
+            flat_k = k.flatten(0, 1)
+            flat_v = v.flatten(0, 1)
+            output = flash_attn_varlen_func(
+                flat_q,
+                flat_k,
+                flat_v,
+                cu_seqlens_q,
+                cu_seqlens_kv,
+                max_seqlen_q,
+                max_seqlen_kv,
+            )
+            output = output.unflatten(0, (q.shape[0], q.shape[1]))
+            _log_once("Varlen attention backend: FlashAttention")
+            return output.to(q.dtype)
+        except Exception as err:  # pylint: disable=broad-except
+            _log_once(f"Varlen FlashAttention failed, falling back ({type(err).__name__})")
 
-    return x
+    return _manual_varlen_sdpa(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
 
 
 class HunyuanAttnProcessorFlashAttnDouble:
